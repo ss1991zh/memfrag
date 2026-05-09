@@ -1,230 +1,229 @@
-# MemFrag — Fragmented Memory System for AI Assistants
-### A next-generation AI memory layer built on OpenClaw + Mem0 + Knowledge Graph
+# MemFrag — Fragmented Memory for Claude
+### A persistent, graph-aware memory layer that runs as an MCP server inside Claude Code and Claude Desktop
 
 [中文文档](README.zh.md)
 
 ---
 
-## 1. What Is MemFrag?
+## What Is MemFrag?
 
-**MemFrag** is a pluggable AI memory enhancement layer that runs as an OpenClaw Skill. It enables your personal AI assistant to work like the human brain — operating on highly compressed memory fragments during normal use, and falling back to raw content only when needed — instead of stuffing the entire conversation history into the context window on every turn.
+MemFrag gives Claude a long-term memory that works like the human brain — storing information as small, interconnected fragments rather than raw conversation history.
 
-> In one line: **Turn AI "memory" from "rewinding a tape" into "reconstructive recall."**
+It runs as an **MCP (Model Context Protocol) server**, so Claude Code and Claude Desktop can call it as a native tool. No external platform needed.
+
+> In one line: **Claude remembers you across sessions, without stuffing your entire history into the context window.**
 
 ---
 
-## 2. Problems It Solves
+## How It Works
 
-| Pain Point with Current Approaches | MemFrag's Solution |
+```
+┌──────────────────────────────────────┐
+│     Claude Code / Claude Desktop     │
+│                                      │
+│  "Remember I prefer Python"          │
+│  "What was my project deadline?"     │
+└────────────┬─────────────────────────┘
+             │ MCP (stdio)
+             ▼
+┌──────────────────────────────────────┐
+│         MemFrag MCP Server           │
+│                                      │
+│  Tools exposed to Claude:            │
+│  ├── memfrag_ingest(turns)           │
+│  ├── memfrag_recall(query)           │
+│  ├── memfrag_list_fragments()        │
+│  ├── memfrag_delete_fragment(id)     │
+│  ├── memfrag_run_decay()             │
+│  └── memfrag_stats()                 │
+│                                      │
+│  Internals:                          │
+│  ├── Fragment Extractor  (Claude LLM)│
+│  ├── Fingerprint Engine  (Embeddings)│
+│  ├── Relationship Graph  (NetworkX)  │
+│  ├── Storage Layer       (SQLite)    │
+│  ├── Recall Engine       (vec+graph) │
+│  └── Decay Scheduler                 │
+└──────────────────────────────────────┘
+```
+
+### Write path (after each conversation turn)
+```
+Claude calls memfrag_ingest(turns)
+  → LLM extracts key fragments (entities, preferences, constraints…)
+  → Each fragment gets a semantic fingerprint (embedding)
+  → Duplicates are detected and merged; updates create override edges
+  → Fragments stored in SQLite; raw text archived with a back-link
+  → Co-topic relationships built automatically via graph
+```
+
+### Read path (before generating a response)
+```
+Claude calls memfrag_recall(query)
+  → Query embedded → vector top-K search
+  → Graph expansion: follow co-topic / causal / override edges (1-2 hops)
+  → Rank by strength × similarity; trim to token budget
+  → Recompose fragments into a natural-language context block
+  → Claude uses that block as grounded memory
+```
+
+---
+
+## Three-Tier Memory Model
+
+| Layer | Stores | Lifetime |
+|---|---|---|
+| **Fragment layer** | Keywords, short phrases, entities, preferences | Long-term (rarely deleted) |
+| **Relationship layer** | Links between fragments (co-topic / temporal / causal / override) | Medium-term (strength evolves) |
+| **Sub-memory archive** | Full raw conversation text | On-demand fallback |
+
+### Forgetting curve
+```
+Initial strength    = 1.0
+Each recall         → strength × 1.2  (cap: 10)
+Every 7 days unused → strength × 0.85
+strength < 0.3      → cold storage (excluded from active recall)
+strength < 0.1      → deleted
+```
+
+---
+
+## Quick Start
+
+### 1. Install
+
+```bash
+git clone https://github.com/ss1991zh/memfrag.git
+cd memfrag
+pip install -e .
+```
+
+### 2. Configure Claude Code
+
+Add to `~/.claude/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "memfrag": {
+      "command": "python",
+      "args": ["-m", "memfrag.mcp_server"],
+      "env": {
+        "ANTHROPIC_API_KEY": "sk-ant-...",
+        "MEMFRAG_DB": "/path/to/memfrag.db"
+      }
+    }
+  }
+}
+```
+
+### 3. Configure Claude Desktop
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "memfrag": {
+      "command": "python",
+      "args": ["-m", "memfrag.mcp_server"],
+      "env": {
+        "ANTHROPIC_API_KEY": "sk-ant-...",
+        "MEMFRAG_DB": "/Users/you/memfrag.db"
+      }
+    }
+  }
+}
+```
+
+### 4. Use in Claude
+
+Once configured, Claude can use memory naturally:
+
+```
+You:    Remember that I'm building a fragmented memory system in Python,
+        targeting Claude integration via MCP.
+
+Claude: [calls memfrag_ingest] ✓ Stored 3 fragments.
+
+You:    What was the project I was working on?
+
+Claude: [calls memfrag_recall] Based on memory:
+        You're building MemFrag — a fragmented memory layer for Claude,
+        implemented in Python and integrated via MCP.
+```
+
+---
+
+## MCP Tools Reference
+
+| Tool | Arguments | Description |
+|---|---|---|
+| `memfrag_ingest` | `turns: [{role, content}]` | Extract and store fragments from conversation turns |
+| `memfrag_recall` | `query: str` | Recall relevant fragments and return a context block |
+| `memfrag_list_fragments` | `include_cold?: bool` | List all active fragments |
+| `memfrag_delete_fragment` | `fragment_id: str` | Delete a specific fragment |
+| `memfrag_run_decay` | — | Run the forgetting-curve pass manually |
+| `memfrag_stats` | — | Return store statistics |
+
+---
+
+## Tech Stack
+
+| Module | Technology |
 |---|---|
-| Conversation history grows endlessly, token costs scale linearly | Only relevant fragments are recalled — context stays lean |
-| RAG chunks are coarse (hundreds of words), full of semantic noise | Fragment granularity down to keyword / short-phrase level |
-| Memory silos: each memory item is unaware of others | A relationship graph layer explicitly links fragments |
-| Model "hallucinations" can't be traced back to a source | Every fragment is bound to a source ID — answers are traceable |
-| Memory store bloats over time, retrieval slows down | Forgetting-curve mechanism auto-archives low-frequency fragments |
+| MCP server | `mcp` Python SDK (stdio transport) |
+| LLM (extraction + recomposition) | Claude Haiku via Anthropic SDK |
+| Embeddings | `sentence-transformers` (BAAI/bge-small-en-v1.5, local) |
+| Vector search | NumPy cosine similarity |
+| Relationship graph | NetworkX |
+| Storage | SQLite (built-in, zero config) |
 
 ---
 
-## 3. Architecture
+## vs. Existing Approaches
 
-```
-┌─────────────────────────────────────────────────────┐
-│                  OpenClaw Platform                  │
-│   WhatsApp / Telegram / WeChat / iMessage / etc.    │
-└────────────────────┬────────────────────────────────┘
-                     │ User message
-                     ▼
-┌─────────────────────────────────────────────────────┐
-│             MemFrag Skill (Core Layer)               │
-│                                                     │
-│  ┌──────────┐   ┌──────────┐   ┌─────────────────┐ │
-│  │Extraction │──▶│Fingerprint──▶│  Relationship   │ │
-│  │ Engine   │   │ Engine   │   │  Graph Engine   │ │
-│  │(LLM-based)│  │(Embedding)│  │(NetworkX/Neo4j) │ │
-│  └──────────┘   └──────────┘   └─────────────────┘ │
-│                                        │            │
-│  ┌──────────────────────────────────────────────┐   │
-│  │              Storage Layer                   │   │
-│  │  Fragment Store (Mem0 + Vector DB)  |  Archive│  │
-│  └──────────────────────────────────────────────┘   │
-│                                        │            │
-│  ┌──────────┐   ┌──────────┐           │            │
-│  │  Recall  │◀──│ Recompose│◀──────────┘            │
-│  │  Engine  │   │  Engine  │                        │
-│  │(vec+graph)│  │(frags→ctx)│                       │
-│  └──────────┘   └──────────┘                        │
-└─────────────────────────────────────────────────────┘
-                     │ Enriched context
-                     ▼
-              LLM generates response
-```
-
----
-
-## 4. Three-Tier Memory Model
-
-### 4.1 Core Fragment Layer (Long-term, rarely deleted)
-Stores minimal semantic units: entities, preferences, constraints, key actions.
-
-```
-Example fragments:
-- [user_pref_001]      User prefers Python, dislikes JavaScript
-- [proj_alpha_deadline] Project Alpha deadline: 2026-06-30
-- [user_habit_002]     User prefers deep work in the evenings
-```
-
-### 4.2 Relationship Layer (Medium-term, strength evolves)
-Directed semantic connections between fragments.
-
-```
-[user_pref_001] --co-topic--> [proj_alpha_deadline]
-[proj_alpha_deadline] --causal--> [user_habit_002]
-[user_pref_001_v2] --override--> [user_pref_001]
-```
-
-Four supported relationship types:
-- **co-topic** — fragments share the same subject
-- **temporal** — A happened before B
-- **causal** — A caused B
-- **override** — B is an update that supersedes A
-
-### 4.3 Sub-Memory Archive Layer (On-demand)
-Full original conversations or document excerpts. Not kept in context by default — the system fetches them only when fragment recall is insufficient.
-
----
-
-## 5. How It Works
-
-### Write Path (runs automatically after each conversation)
-```
-1. LLM extracts fragment candidates from the conversation
-2. Filter: is this fragment reusable / stable / self-contained?
-3. Embedding model generates a semantic fingerprint
-4. Similarity check against existing fragments:
-   - New content   → create new fragment
-   - Update        → add override edge, down-weight old fragment
-   - Supplementary → add co-topic edge
-5. Fragment saved to store; raw text archived with a back-link
-```
-
-### Recall Path (runs automatically before each conversation)
-```
-1. Generate a query vector from the current message
-2. Vector search → Top-K fragments
-3. Graph expansion: traverse relationship edges (1–2 hops)
-4. Rank by strength score; truncate at token budget
-5. If fragments are insufficient, fetch sub-memory archive via back-link
-6. Recompose into a natural-language context prefix
-```
-
----
-
-## 6. Key Mechanisms
-
-### 6.1 Forgetting Curve
-```
-Initial strength       = 1.0
-Each recall            → strength × 1.2 (cap: 10)
-Every 7 days unused    → strength × 0.85
-Strength < 0.3         → moved to cold storage
-Strength < 0.1         → marked for cleanup
-```
-
-### 6.2 Anti-Hallucination
-- Every recomposed sentence retains its source fragment ID
-- LLM prompt explicitly separates `[MEMORY FACT]` from `[INFERENCE]`
-- Uncertain relationships are dropped rather than fabricated
-
-### 6.3 Cold-Start Strategy
-- First 5 conversations: use full history (traditional mode)
-- After 5 conversations: fragment store is populated, switch to fragment mode
-- Hybrid mode available: fragments + last N turns of raw history
-
----
-
-## 7. Tech Stack
-
-| Module | Technology | Notes |
-|---|---|---|
-| Platform | OpenClaw | TypeScript, multi-channel |
-| Fragment extraction | Mem0 | Python, native LLM-based extraction |
-| Embedding | BGE-M3 / text-embedding-3-small | BGE-M3 preferred for Chinese+English |
-| Vector store | Qdrant | Self-hosted, supports metadata filtering |
-| Relationship graph | NetworkX (dev) / Neo4j (prod) | |
-| Archive store | SQLite / local files | Upgrade to S3 later |
-| LLM | Claude Sonnet / GPT-4o | Configurable |
-| OpenClaw ↔ Mem0 | REST API / gRPC | MemFrag runs as an independent service |
-
----
-
-## 8. Comparison with Existing Approaches
-
-| Approach | Granularity | Relationship Layer | Channel Integration | Decay Mechanism |
+| | MemFrag | Mem0 | Letta | GraphRAG |
 |---|---|---|---|---|
-| **MemFrag** | Word / phrase | ✅ Explicit graph | ✅ via OpenClaw | ✅ |
-| Mem0 | Short sentence | ❌ | ❌ | ❌ |
-| Letta | Paragraph | ❌ | ❌ | ❌ |
-| GraphRAG | Paragraph | ✅ | ❌ | ❌ |
-| Traditional RAG | Paragraph | ❌ | ❌ | ❌ |
+| Claude-native (MCP) | ✅ | ❌ | ❌ | ❌ |
+| Granularity | Word/phrase | Short sentence | Paragraph | Paragraph |
+| Relationship graph | ✅ | ❌ | ❌ | ✅ |
+| Forgetting curve | ✅ | ❌ | ❌ | ❌ |
+| Zero-config storage | ✅ SQLite | ❌ | ❌ | ❌ |
 
 ---
 
-## 9. MVP Roadmap
+## REST API (optional)
 
-### Phase 1 — Single-scene validation (2 weeks)
-**Goal**: Validate fragment mode vs. full-history on "remembering user writing preferences"
+MemFrag also ships a FastAPI server for non-MCP integrations:
 
-- [ ] Set up Mem0 base memory layer
-- [ ] Implement basic extraction + vector recall
-- [ ] A/B comparison: token cost and answer accuracy
+```bash
+ANTHROPIC_API_KEY=sk-ant-... uvicorn memfrag.api:app --port 8765
+```
 
-### Phase 2 — Relationship graph (2 weeks)
-**Goal**: Add graph layer, measure multi-hop recall quality improvement
-
-- [ ] NetworkX implementation of four relationship types
-- [ ] Graph-expansion recall logic
-- [ ] Hallucination rate comparison test
-
-### Phase 3 — OpenClaw integration (1 week)
-**Goal**: Package as an OpenClaw Skill, real-user test on Telegram
-
-- [ ] MemFrag service layer (REST API)
-- [ ] OpenClaw Skill wrapper
-- [ ] Telegram end-to-end test
-
-### Phase 4 — Decay + cold storage (1 week)
-**Goal**: Confirm memory store doesn't bloat over long-term use
-
-- [ ] Forgetting-curve implementation
-- [ ] Cold storage + auto-cleanup
-- [ ] 30-day stress test
+Endpoints: `POST /ingest`, `POST /recall`, `POST /decay`, `GET /stats`, `GET /fragments`, `DELETE /fragments/{id}`
 
 ---
 
-## 10. Risks & Mitigations
+## Running Tests
 
-| Risk | Likelihood | Mitigation |
-|---|---|---|
-| Over-fragmentation loses context | Medium | Dynamic granularity: key content stays as phrases, secondary content compressed to keywords |
-| Recall accuracy too low | Medium | Dual-path: vector + graph, each compensating the other |
-| Model hallucination during recomposition | High | Mandatory source annotation + prompt constraints |
-| OpenClaw ↔ MemFrag latency | Low | Async write, sync recall; pre-cache hot fragments |
-| Python (Mem0) / TypeScript (OpenClaw) cross-language overhead | Low | MemFrag as an independent microservice over HTTP |
+```bash
+pip install -e ".[dev]"
+pytest tests/          # 61+ tests, no API key needed
+```
 
 ---
 
-## 11. Name & Identity
+## Roadmap
 
-- **MemFrag**: Memory Fragments
-- Internal alias: **Memento** (a nod to the film *Memento*)
-- OpenClaw Skill ID: `memfrag-core`
-
----
-
-## Contributing
-
-This project is in early design phase. Discussion and ideas are welcome via Issues.
+- [x] Core fragment extraction, graph, storage, recall
+- [x] Forgetting curve
+- [x] REST API
+- [x] MCP server
+- [ ] End-to-end test with real API key
+- [ ] Neo4j graph backend (production scale)
+- [ ] Multi-user support
 
 ---
 
-*Document version: v0.1 | 2026-05-09*
+*Version 0.2.0 · 2026-05-09*

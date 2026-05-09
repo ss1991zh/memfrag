@@ -1,13 +1,17 @@
-# MemFrag — 碎片化记忆系统
-### 基于 OpenClaw + Mem0 + 知识图谱的新一代 AI 个人记忆层
+# MemFrag — Claude 的碎片化记忆系统
+### 以 MCP Server 形式运行，直接在 Claude Code 和 Claude Desktop 中提供持久化记忆
+
+[English README](README.md)
 
 ---
 
 ## 一、产品定位
 
-**MemFrag** 是一个可插拔的 AI 记忆增强层，以 OpenClaw Skill 的形式运行。它让你的个人 AI 助手像人脑一样工作——平时只操作高度压缩的记忆碎片，需要细节时才回溯原始内容——而不是每次对话都把所有历史塞进上下文。
+**MemFrag** 让 Claude 拥有跨会话的长期记忆，工作方式类似人脑——把信息存成可重组的碎片，而不是把完整对话历史塞进上下文。
 
-> 一句话：**把 AI 的"记忆"从"翻录像带"变成"重构性回忆"。**
+它以 **MCP（Model Context Protocol）Server** 的形式运行，Claude Code 和 Claude Desktop 可以把它当作原生工具直接调用，无需任何第三方平台。
+
+> 一句话：**Claude 跨会话记住你，而不是每次对话都从零开始。**
 
 ---
 
@@ -20,201 +24,219 @@
 | 记忆孤岛：各条记忆互相不知道对方存在 | 关系图层显式建立碎片间的语义连接 |
 | 模型"脑补"无法溯源，出处不明 | 每条碎片绑定来源 ID，回答可追溯 |
 | 记忆库无限膨胀，检索越来越慢 | 遗忘曲线机制，低频碎片自动冷存储 |
+| 需要额外平台才能运行 | 原生 MCP，Claude Code/Desktop 直接用 |
 
 ---
 
-## 三、核心架构
+## 三、整体架构
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                    OpenClaw 平台                     │
-│   WhatsApp / Telegram / 微信 / iMessage / 等渠道      │
-└────────────────────┬────────────────────────────────┘
-                     │ 用户消息
-                     ▼
-┌─────────────────────────────────────────────────────┐
-│              MemFrag Skill（核心层）                  │
-│                                                     │
-│  ┌──────────┐   ┌──────────┐   ┌─────────────────┐ │
-│  │ 提取引擎  │──▶│ 指纹引擎  │──▶│   关系图引擎     │ │
-│  │(LLM抽碎片)│   │(Embedding)│   │(NetworkX/Neo4j) │ │
-│  └──────────┘   └──────────┘   └─────────────────┘ │
-│                                        │            │
-│  ┌──────────────────────────────────────────────┐   │
-│  │              存储层                           │   │
-│  │  碎片库（Mem0 + 向量DB）  |  子记忆文件归档   │   │
-│  └──────────────────────────────────────────────┘   │
-│                                        │            │
-│  ┌──────────┐   ┌──────────┐           │            │
-│  │ 召回引擎  │◀──│ 重组引擎  │◀──────────┘            │
-│  │(向量+图谱)│   │(碎片→上下文)│                      │
-│  └──────────┘   └──────────┘                        │
-└─────────────────────────────────────────────────────┘
-                     │ 富上下文
-                     ▼
-               LLM 生成回答
+┌──────────────────────────────────────┐
+│     Claude Code / Claude Desktop     │
+│                                      │
+│  "记住我用 Python 做后端"             │
+│  "我的项目截止日是什么时候？"          │
+└────────────┬─────────────────────────┘
+             │ MCP 协议（stdio）
+             ▼
+┌──────────────────────────────────────┐
+│        MemFrag MCP Server            │
+│                                      │
+│  暴露给 Claude 的工具：               │
+│  ├── memfrag_ingest(turns)           │
+│  ├── memfrag_recall(query)           │
+│  ├── memfrag_list_fragments()        │
+│  ├── memfrag_delete_fragment(id)     │
+│  ├── memfrag_run_decay()             │
+│  └── memfrag_stats()                 │
+│                                      │
+│  内部组件：                           │
+│  ├── 碎片提取器   (Claude LLM)        │
+│  ├── 语义指纹引擎 (Embedding)         │
+│  ├── 关系图层     (NetworkX)          │
+│  ├── 存储层       (SQLite)            │
+│  ├── 召回引擎     (向量+图谱)          │
+│  └── 遗忘曲线调度器                   │
+└──────────────────────────────────────┘
+```
+
+### 写入路径（每次对话后）
+```
+Claude 调用 memfrag_ingest(turns)
+  → LLM 从对话中提取关键碎片（实体、偏好、约束…）
+  → 每个碎片生成语义指纹（embedding）
+  → 重复碎片合并；更新内容建立 override 边
+  → 碎片存入 SQLite；原文归档并建立反向链接
+  → 基于相似度自动建立 co-topic 关系
+```
+
+### 召回路径（生成回答前）
+```
+Claude 调用 memfrag_recall(query)
+  → 查询向量化 → Top-K 向量搜索
+  → 图谱扩展：沿 co-topic / causal / override 边遍历（1-2跳）
+  → 按强度 × 相似度排序，截断至 token 预算
+  → 重组为自然语言上下文块
+  → Claude 基于该上下文块生成有据可查的回答
 ```
 
 ---
 
 ## 四、三层记忆模型
 
-### 4.1 核心碎片层（长期，几乎不删）
-存储最小语义单元：实体、偏好、约束、关键动作
+| 层级 | 存储内容 | 生命周期 |
+|---|---|---|
+| **碎片层** | 关键词、短句、实体、偏好 | 长期（几乎不删） |
+| **关系层** | 碎片间连接（同主题 / 时间序 / 因果 / 覆盖） | 中期（强度动态变化） |
+| **子记忆归档** | 完整原始对话文本 | 按需回滚 |
 
+### 遗忘曲线参数
 ```
-示例碎片：
-- [user_pref_001] 用户偏好用 Python，不喜欢 JavaScript
-- [proj_alpha_deadline] Alpha 项目截止日 2026-06-30
-- [user_habit_002] 用户习惯在晚上处理深度工作
-```
-
-### 4.2 关系层（中期，会强化或衰减）
-碎片之间的有向语义连接
-
-```
-[user_pref_001] --同主题--> [proj_alpha_deadline]
-[proj_alpha_deadline] --因果--> [user_habit_002]
-[user_pref_001_v2] --覆盖--> [user_pref_001]
-```
-
-支持四类关系：
-- **co-topic**（同主题）
-- **temporal**（时间序）
-- **causal**（因果）
-- **override**（覆盖/更新）
-
-### 4.3 子记忆文件层（按需，归档）
-完整原始对话或文档段落，仅在碎片不足时由系统主动回滚读取，不常驻上下文。
-
----
-
-## 五、工作流程
-
-### 写入（每次对话后自动执行）
-```
-1. LLM 从对话中提取碎片候选
-2. 过滤器判断是否值得存储（可复用 / 稳定 / 可独立理解）
-3. Embedding 模型生成语义指纹
-4. 与现有碎片做相似度比对：
-   - 新内容 → 新建碎片
-   - 更新内容 → 打 override 关系，旧碎片降权
-   - 补充内容 → 建 co-topic 关系
-5. 碎片入库，原文存入子记忆文件并建立反向链接
-```
-
-### 召回（每次对话前自动执行）
-```
-1. 当前问题生成查询向量
-2. 向量检索 Top-K 碎片
-3. 图谱扩展：沿关系边拉取关联碎片（1-2跳）
-4. 按强度值排序，超出 token 预算的截断
-5. 碎片不足时，根据反向链接读取子记忆文件片段
-6. 重组为自然语言前缀注入上下文
+初始强度          = 1.0
+每次被召回        → 强度 × 1.2（上限 10）
+每 7 天未被调用   → 强度 × 0.85
+强度 < 0.3        → 冷存储（不参与主动召回）
+强度 < 0.1        → 自动删除
 ```
 
 ---
 
-## 六、关键机制
+## 五、快速开始
 
-### 6.1 遗忘曲线
+### 1. 安装
+
+```bash
+git clone https://github.com/ss1991zh/memfrag.git
+cd memfrag
+pip install -e .
 ```
-碎片强度初始值 = 1.0
-每次被召回      → 强度 × 1.2（上限 10）
-每 7 天未被调用 → 强度 × 0.85
-强度 < 0.3      → 移入冷存储
-强度 < 0.1      → 标记待清理
+
+### 2. 配置 Claude Code
+
+在 `~/.claude/settings.json` 中添加：
+
+```json
+{
+  "mcpServers": {
+    "memfrag": {
+      "command": "python",
+      "args": ["-m", "memfrag.mcp_server"],
+      "env": {
+        "ANTHROPIC_API_KEY": "sk-ant-...",
+        "MEMFRAG_DB": "/path/to/memfrag.db"
+      }
+    }
+  }
+}
 ```
 
-### 6.2 防幻觉机制
-- 重组后的上下文每句话保留来源碎片 ID
-- LLM prompt 中明确区分：`[记忆事实]` vs `[推理]`
-- 不确定的碎片关系：宁缺毋滥，不强行连接
+### 3. 配置 Claude Desktop
 
-### 6.3 冷启动策略
-- 前 5 次对话：直接使用完整历史（传统模式）
-- 5 次后：碎片库积累足够，切换为碎片模式
-- 两种模式可混合：碎片 + 最近 N 轮原文
+在 `~/Library/Application Support/Claude/claude_desktop_config.json` 中添加：
+
+```json
+{
+  "mcpServers": {
+    "memfrag": {
+      "command": "python",
+      "args": ["-m", "memfrag.mcp_server"],
+      "env": {
+        "ANTHROPIC_API_KEY": "sk-ant-...",
+        "MEMFRAG_DB": "/Users/你的用户名/memfrag.db"
+      }
+    }
+  }
+}
+```
+
+### 4. 在 Claude 中使用
+
+配置好后，Claude 可以自然地使用记忆：
+
+```
+你：    记住我正在用 Python 开发一个碎片化记忆系统，
+        通过 MCP 集成到 Claude 中。
+
+Claude：[调用 memfrag_ingest] ✓ 已存储 3 条碎片。
+
+你：    我在做什么项目？
+
+Claude：[调用 memfrag_recall] 根据记忆：
+        你正在开发 MemFrag —— 一个 Python 实现的碎片化
+        记忆层，通过 MCP 协议集成到 Claude。
+```
+
+---
+
+## 六、MCP 工具说明
+
+| 工具名 | 参数 | 功能 |
+|---|---|---|
+| `memfrag_ingest` | `turns: [{role, content}]` | 从对话中提取并存储碎片 |
+| `memfrag_recall` | `query: str` | 召回相关碎片，返回上下文块 |
+| `memfrag_list_fragments` | `include_cold?: bool` | 列出所有活跃碎片 |
+| `memfrag_delete_fragment` | `fragment_id: str` | 删除指定碎片 |
+| `memfrag_run_decay` | — | 手动触发遗忘曲线 |
+| `memfrag_stats` | — | 返回存储统计信息 |
 
 ---
 
 ## 七、技术栈
 
-| 模块 | 技术选型 | 备注 |
-|---|---|---|
-| 平台层 | OpenClaw | TypeScript，多渠道接入 |
-| 碎片提取 | Mem0 | Python，原生支持 LLM 抽取 |
-| Embedding | BGE-M3 / text-embedding-3-small | 中英文双语优先选 BGE-M3 |
-| 向量存储 | Qdrant | 本地部署，支持过滤 |
-| 关系图 | NetworkX（起步）/ Neo4j（生产） | |
-| 子记忆归档 | SQLite / 本地文件 | 按需升级到 S3 |
-| LLM | Claude Sonnet / GPT-4o | 可配置 |
-| OpenClaw ↔ Mem0 通信 | REST API / gRPC | MemFrag 作为独立服务运行 |
+| 模块 | 技术选型 |
+|---|---|
+| MCP Server | `mcp` Python SDK（stdio 传输） |
+| LLM（提取 + 重组） | Claude Haiku（Anthropic SDK） |
+| Embedding | `sentence-transformers`（本地，无需额外 API） |
+| 向量搜索 | NumPy 余弦相似度 |
+| 关系图 | NetworkX |
+| 存储 | SQLite（内置，零配置） |
 
 ---
 
-## 八、与现有方案的差异
+## 八、与现有方案对比
 
-| 方案 | 颗粒度 | 关系层 | 渠道接入 | 衰减机制 |
+| | MemFrag | Mem0 | Letta | GraphRAG |
 |---|---|---|---|---|
-| **MemFrag** | 词/短句级 | ✅ 显式图谱 | ✅ via OpenClaw | ✅ |
-| Mem0 | 短句级 | ❌ | ❌ | ❌ |
-| Letta | 段落级 | ❌ | ❌ | ❌ |
-| GraphRAG | 段落级 | ✅ | ❌ | ❌ |
-| 传统 RAG | 段落级 | ❌ | ❌ | ❌ |
+| Claude 原生（MCP） | ✅ | ❌ | ❌ | ❌ |
+| 碎片粒度 | 词/短句级 | 短句级 | 段落级 | 段落级 |
+| 关系图层 | ✅ | ❌ | ❌ | ✅ |
+| 遗忘曲线 | ✅ | ❌ | ❌ | ❌ |
+| 零配置存储 | ✅ SQLite | ❌ | ❌ | ❌ |
 
 ---
 
-## 九、MVP 验证计划
+## 九、REST API（可选）
 
-### 第一阶段：单场景验证（2 周）
-**目标**：在"记住用户写作偏好"这个场景下，验证碎片模式 vs 完整历史的效果差异
+MemFrag 同时提供 FastAPI 服务，供非 MCP 场景使用：
 
-- [ ] 搭建 Mem0 基础记忆层
-- [ ] 实现最简版提取 + 向量召回
-- [ ] 对比实验：token 消耗、回答准确率
+```bash
+ANTHROPIC_API_KEY=sk-ant-... uvicorn memfrag.api:app --port 8765
+```
 
-### 第二阶段：关系图层（2 周）
-**目标**：加入图谱，验证多跳关系对召回质量的提升
-
-- [ ] NetworkX 实现四类关系
-- [ ] 图谱扩展召回逻辑
-- [ ] 幻觉率对比测试
-
-### 第三阶段：OpenClaw 集成（1 周）
-**目标**：打包为 OpenClaw Skill，接入 Telegram 渠道做真实用户测试
-
-- [ ] MemFrag 服务化（REST API）
-- [ ] OpenClaw Skill 封装
-- [ ] Telegram 渠道端到端测试
-
-### 第四阶段：衰减 + 冷存储（1 周）
-**目标**：验证长期运行下记忆库不膨胀
-
-- [ ] 遗忘曲线实现
-- [ ] 冷存储 + 自动清理
-- [ ] 30 天压力测试
+接口：`POST /ingest`、`POST /recall`、`POST /decay`、`GET /stats`、`GET /fragments`、`DELETE /fragments/{id}`
 
 ---
 
-## 十、潜在风险与对策
+## 十、运行测试
 
-| 风险 | 概率 | 对策 |
-|---|---|---|
-| 碎片粒度过细，丢失语境 | 中 | 动态粒度：重要内容保留短句，次要内容压缩到关键词 |
-| 召回准确率不足 | 中 | 向量 + 图谱双路召回，互为补充 |
-| 重组时模型脑补 | 高 | 强制来源标注 + prompt 约束 |
-| OpenClaw ↔ MemFrag 延迟 | 低 | 异步写入，同步召回；预加载热碎片 |
-| Mem0 Python / OpenClaw TypeScript 跨语言 | 低 | MemFrag 作为独立微服务，HTTP 通信 |
+```bash
+pip install -e ".[dev]"
+pytest tests/     # 61+ 个测试，无需 API Key
+```
 
 ---
 
-## 十一、命名说明
+## 十一、路线图
 
-- **MemFrag**：Memory Fragments，碎片化记忆
-- 内部也可叫 **Memento**（致敬《记忆碎片》这部电影）
-- OpenClaw Skill ID 建议：`memfrag-core`
+- [x] 碎片提取、关系图、存储、召回
+- [x] 遗忘曲线
+- [x] REST API
+- [x] MCP Server
+- [ ] 真实 API Key 端到端测试
+- [ ] Neo4j 图谱后端（生产规模）
+- [ ] 多用户支持
 
 ---
 
-*文档版本：v0.1 | 2026-05-09*
+*版本 0.2.0 · 2026-05-09*
